@@ -1,0 +1,20 @@
+version: '3.8'
+
+services:
+  audiogist:
+    build: .
+    container_name: audiogist
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./downloads:/app/downloads
+      - ./transcripts:/app/transcripts
+    environment:
+      - OLLAMA_HOST=http://host.docker.internal:11434
+      - LMSTUDIO_HOST=http://host.docker.internal:1234
+    networks:
+      - ai_network
+
+networks:
+  ai_network:
+    driver: bridge

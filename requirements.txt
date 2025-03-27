@@ -1,4 +1,9 @@
-streamlit
-yt-dlp
-openai-whisper
-requests
+streamlit>=1.22.0
+yt-dlp>=2023.3.4
+openai-whisper>=20230314
+requests>=2.28.2
+tiktoken>=0.3.3
+PyPDF2>=3.0.0
+python-docx>=0.8.11
+numpy>=1.22.0
+pandas>=1.5.0

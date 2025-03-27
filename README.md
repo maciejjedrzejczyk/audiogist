@@ -161,8 +161,3 @@ The application runs on the user's local machine, requiring minimal setup while 
 - **"LM Studio is not running"**: Make sure LM Studio is running with the API server enabled
 - **Transcription errors**: Try using a smaller Whisper model or check your audio quality
 - **Missing models**: Use the "Refresh Available Models" button to update the model list
-
-## License
-
-[MIT License](LICENSE)
-```

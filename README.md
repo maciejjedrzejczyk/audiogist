@@ -76,8 +76,8 @@ The application runs on the user's local machine, requiring minimal setup while 
 
 1. Clone this repository or download the source code:
    ```bash
-   git clone https://github.com/maciejjedrzejczyk/youtube-transcription-tool.git
-   cd youtube-transcription-tool
+   git clone https://github.com/maciejjedrzejczyk/audiogist.git
+   cd audiogist
    ```
 
 2. Install the required Python packages:

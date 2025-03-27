@@ -3,6 +3,8 @@
 
 **AudioGist** is a powerful application that solves a critical time management problem: determining which long-form audio content deserves your attention without investing hours in listening.
 
+<img src="audiogist.gif" alt="audiogist" width="500" height="800">
+
 AudioGist automatically processes YouTube videos and audio files to generate concise transcripts and AI-powered summaries, enabling users to:
 
 - **Rapidly evaluate content relevance** before committing valuable time to full consumption

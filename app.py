@@ -4,6 +4,7 @@ import os
 import warnings
 import whisper
 import requests
+import logging
 import tempfile
 import glob
 import logging
@@ -15,6 +16,44 @@ import docx
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 
+# --- Setup verbose logging to file and console ---
+# Configure root logger
+LOG_FILE = os.environ.get("AUDIOGIST_LOG", os.path.join(os.getcwd(), "audiogist.log"))
+try:
+    os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+except Exception:
+    pass
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_FILE),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger()
+# Monkey-patch requests to log all API calls
+_orig_requests_get = requests.get
+_orig_requests_post = requests.post
+def http_get(url, **kwargs):
+    logger.debug(f"HTTP GET: {url} kwargs={kwargs}")
+    resp = _orig_requests_get(url, **kwargs)
+    try:
+        logger.debug(f"HTTP GET Response [{resp.status_code}]: {resp.text}")
+    except Exception:
+        logger.debug(f"HTTP GET Response [{resp.status_code}]: <no text>")
+    return resp
+def http_post(url, **kwargs):
+    logger.debug(f"HTTP POST: {url} kwargs={kwargs}")
+    resp = _orig_requests_post(url, **kwargs)
+    try:
+        logger.debug(f"HTTP POST Response [{resp.status_code}]: {resp.text}")
+    except Exception:
+        logger.debug(f"HTTP POST Response [{resp.status_code}]: <no text>")
+    return resp
+requests.get = http_get
+requests.post = http_post
+
 # Use environment variables with defaults
 DEFAULT_OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 DEFAULT_LMSTUDIO_HOST = os.environ.get("LMSTUDIO_HOST", "http://localhost:1234")
@@ -23,7 +62,7 @@ DEFAULT_TRANSCRIPT_DIR = os.environ.get("TRANSCRIPT_DIR", "/app/transcripts")
 
 # Suppress warnings
 warnings.filterwarnings("ignore")
-logging.getLogger("yt_dlp").setLevel(logging.ERROR)
+logging.getLogger("yt_dlp").setLevel(logging.DEBUG)
 
 st.set_page_config(
     page_title="AudioGist",
@@ -112,14 +151,17 @@ def get_available_lmstudio_models():
 
 # Function to download YouTube audio
 def download_youtube_audio(url, output_dir, filename_base):
+    logger.info(f"download_youtube_audio: url={url}, output_dir={output_dir}, filename_base={filename_base}")
     # Create full path but without extension (yt-dlp will add it)
     output_template = os.path.join(output_dir, filename_base)
-    # Configure yt-dlp to be quieter
+    # Configure yt-dlp to be quieter while logging progress
     ydl_opts = {
         'format': 'bestaudio/best',
         'outtmpl': output_template,
         'quiet': True,  # Reduce console output
         'no_warnings': True,  # Suppress warnings
+        'logger': logger,
+        'progress_hooks': [lambda d: logger.debug(f"yt_dlp progress: {d}")],
         'postprocessors': [{
             'key': 'FFmpegExtractAudio',
             'preferredcodec': 'mp3',
@@ -128,25 +170,33 @@ def download_youtube_audio(url, output_dir, filename_base):
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
+        logger.debug(f"yt_dlp.extract_info result title={info.get('title')} format={info.get('format')} entries={info.get('entries') is not None}")
         title = info.get('title', 'Unknown Title')
+        logger.info(f"download_youtube_audio: downloaded title='{title}'")
         # Find the actual downloaded file (yt-dlp might add .mp3 extension)
         # Look for any file that starts with our base filename
         possible_files = glob.glob(f"{output_template}*")
         if possible_files:
-            # Return the actual file path and the video title
-            return possible_files[0], title
+            file_path = possible_files[0]
+            logger.info(f"download_youtube_audio: file found {file_path}")
+            return file_path, title
         else:
-            # Fallback to expected path with .mp3 extension
-            return f"{output_template}.mp3", title
+            file_path = f"{output_template}.mp3"
+            logger.info(f"download_youtube_audio: fallback to file {file_path}")
+            return file_path, title
 
 # Function to transcribe audio using Whisper
 def transcribe_audio(audio_path, language, model_size):
+    logger.info(f"transcribe_audio: path={audio_path}, language={language}, model_size={model_size}")
     # Suppress warnings during model loading and transcription
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore")
         model = whisper.load_model(model_size)
         result = model.transcribe(audio_path, language=language)
-        return result["text"]
+        text = result.get("text", "")
+        logger.info(f"transcribe_audio: completed, {len(text)} characters transcribed")
+        logger.debug(f"transcribe_audio: transcript snippet: {text[:200]}")
+        return text
 
 # Function to chunk text
 def chunk_text(text, chunk_size=4000, overlap=200):
@@ -155,23 +205,81 @@ def chunk_text(text, chunk_size=4000, overlap=200):
         chunk = text[i:i + chunk_size]
         chunks.append(chunk)
     return chunks
+ 
+# Function to download YouTube automatic captions as transcript
+def get_youtube_transcript(url, language_code):
+    logger.info(f"get_youtube_transcript: url={url}, language_code={language_code}")
+    try:
+        opts = {'quiet': True, 'no_warnings': True, 'logger': logger}
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+        auto_caps = info.get('automatic_captions', {}) or {}
+        logger.debug(f"get_youtube_transcript: automatic_captions keys={list(auto_caps.keys())}")
+        # Try requested language, else pick first available
+        caps_list = auto_caps.get(language_code)
+        if not caps_list:
+            for caps_list in auto_caps.values():
+                break
+        if not caps_list:
+            return None
+        # Prefer VTT format
+        subtitle_url = None
+        for entry in caps_list:
+            if entry.get('ext') == 'vtt':
+                subtitle_url = entry.get('url')
+                break
+        if not subtitle_url:
+            subtitle_url = caps_list[0].get('url')
+        logger.info(f"get_youtube_transcript: fetching subtitles from {subtitle_url}")
+        resp = requests.get(subtitle_url)
+        if resp.status_code != 200:
+            logger.warning(f"get_youtube_transcript: failed to fetch subtitles, status={resp.status_code}")
+            return None
+        # Parse VTT: skip timestamps and headers
+        lines = []
+        for line in resp.text.splitlines():
+            if '-->' in line or line.startswith('WEBVTT') or not line.strip():
+                continue
+            lines.append(line.strip())
+        transcript = ' '.join(lines)
+        logger.info(f"get_youtube_transcript: parsed transcript, length={len(transcript)} chars")
+        logger.debug(f"get_youtube_transcript: transcript snippet={transcript[:200]}")
+        return transcript
+    except Exception:
+        return None
 
 # Function to get summary from Ollama
-def get_summary_from_ollama(transcript, language, model="llama3", custom_prompt=None, token_limit=4000):
+def get_summary_from_ollama(transcript, language, model="llama3", custom_prompt=None, token_limit=60000):
+    logger.debug(
+        f"get_summary_from_ollama called with model={model}, language={language}, token_limit={token_limit}, "
+        f"custom_prompt_provided={custom_prompt is not None}, transcript_length={len(transcript)} chars\n"
+        f"Full transcript:\n{transcript}"
+    )
+    # Build summarization prompt with token budgeting
+    lang_name = list(LANGUAGES.keys())[list(LANGUAGES.values()).index(language)]
+    # Prepare prompt template
     if custom_prompt:
-        prompt = custom_prompt.replace("{transcript}", transcript[:token_limit])
-        prompt = prompt.replace("{language}", list(LANGUAGES.keys())[list(LANGUAGES.values()).index(language)])
+        tmpl = custom_prompt.replace("{language}", lang_name)
+        parts = tmpl.split("{transcript}")
+        pre = parts[0]
+        post = parts[1] if len(parts) > 1 else ""
     else:
-        prompt = f"""
-        Please summarize the following transcript and extract key talking points.
-        Provide your response in {list(LANGUAGES.keys())[list(LANGUAGES.values()).index(language)]}.
-        Transcript:
-        {transcript[:token_limit]}
-        Please provide:
-        1. A concise summary (3-5 sentences)
-        2. 5-7 key talking points
-        3. Any notable quotes or statements
-        """
+        pre = (
+            f"Please summarize the following transcript and extract key talking points.\n"
+            f"Provide your response in {lang_name}.\n"
+            f"Transcript:\n"
+        )
+        post = (
+            "\nPlease provide:\n"
+            "1. A concise summary (3-5 sentences)\n"
+            "2. 5-7 key talking points\n"
+            "3. Any notable quotes or statements\n"
+        )
+    # Build full prompt and adjust token window to transcript size
+    prompt = pre + transcript + post
+    total_tokens = estimate_tokens(prompt)
+    logger.info(f"Ollama prompt tokens: {total_tokens}")
+    logger.debug(f"get_summary_from_ollama prompt (~{total_tokens} tokens):\n{prompt}")
     try:
         response = requests.post(
             f"{DEFAULT_OLLAMA_HOST}/api/generate",
@@ -190,6 +298,12 @@ def get_summary_from_ollama(transcript, language, model="llama3", custom_prompt=
 
 # Function to get response from Ollama for chat
 def get_chat_response_from_ollama(transcript, question, language, model="llama3"):
+    logger.debug(
+        f"get_chat_response_from_ollama called with model={model}, language={language}\n"
+        f"User question: {question}\n"
+        f"Transcript length: {len(transcript)} chars\n"
+        f"Full transcript:\n{transcript}"
+    )
     prompt = f"""
     You are an AI assistant helping with questions about a transcript.
     Transcript:
@@ -197,6 +311,7 @@ def get_chat_response_from_ollama(transcript, question, language, model="llama3"
     User question: {question}
     Please provide a helpful, accurate response in {list(LANGUAGES.keys())[list(LANGUAGES.values()).index(language)]}.
     """
+    logger.debug(f"get_chat_response_from_ollama prompt:\n{prompt}")
     try:
         response = requests.post(
             f"{DEFAULT_OLLAMA_HOST}/api/generate",
@@ -253,9 +368,58 @@ def process_chunk_with_lmstudio(chunk, prompt_template, model, language):
             return f"Error: {response.status_code} - {response.text}"
     except Exception as e:
         return f"Error connecting to LM Studio: {str(e)}"
+ 
+# Safe wrapper to handle context-length errors by recursively splitting chunks
+def safe_process_chunk_with_lmstudio(chunk, prompt_template, model, language, min_chunk_length=500):
+    """
+    Attempt to summarize a chunk; if LM Studio reports context-length errors,
+    split the chunk in half and retry each half recursively.
+    """
+    # Call the underlying summarization
+    result = process_chunk_with_lmstudio(chunk, prompt_template, model, language)
+    # If error indicates context length exceeded, split and retry
+    if isinstance(result, str) and ("number of tokens to keep" in result.lower() or "context length" in result.lower()):
+        if len(chunk) <= min_chunk_length:
+            return result
+        mid = len(chunk) // 2
+        part1 = safe_process_chunk_with_lmstudio(chunk[:mid], prompt_template, model, language, min_chunk_length)
+        part2 = safe_process_chunk_with_lmstudio(chunk[mid:], prompt_template, model, language, min_chunk_length)
+        return part1 + "\n\n" + part2
+    return result
+
+# Function to unload and reload an LM Studio model to clear context
+def unload_and_reload_lmstudio_model(model):
+    """
+    Unload and reload the LM Studio model via API calls.
+    """
+    try:
+        unload_resp = requests.post(f"{DEFAULT_LMSTUDIO_HOST}/v1/models/{model}/unload")
+        if unload_resp.status_code == 200:
+            logging.info(f"Unloaded LM Studio model '{model}'")
+        else:
+            logging.warning(
+                f"Failed to unload LM Studio model '{model}': {unload_resp.status_code} - {unload_resp.text}"
+            )
+    except Exception as e:
+        logging.warning(f"Error unloading LM Studio model '{model}': {e}")
+    try:
+        reload_resp = requests.post(f"{DEFAULT_LMSTUDIO_HOST}/v1/models/{model}/reload")
+        if reload_resp.status_code == 200:
+            logging.info(f"Reloaded LM Studio model '{model}'")
+        else:
+            logging.warning(
+                f"Failed to reload LM Studio model '{model}': {reload_resp.status_code} - {reload_resp.text}"
+            )
+    except Exception as e:
+        logging.warning(f"Error reloading LM Studio model '{model}': {e}")
 
 # Function to get chunked summary from LM Studio
 def get_chunked_summary_from_lmstudio(transcript, language, model, custom_prompt=None, chunk_size=4000, overlap=200):
+    logger.debug(
+        f"get_chunked_summary_from_lmstudio called with model={model}, language={language}, "
+        f"chunk_size={chunk_size}, overlap={overlap}, custom_prompt_provided={custom_prompt is not None}, "
+        f"transcript_length={len(transcript)} chars\nFull transcript:\n{transcript}"
+    )
     """
     Process a transcript by breaking it into chunks and summarizing each chunk,
     then providing an overall summary.
@@ -271,8 +435,9 @@ def get_chunked_summary_from_lmstudio(transcript, language, model, custom_prompt
     Returns:
         dict: Dictionary containing the overall summary and individual chunk summaries
     """
-    # Break the transcript into chunks
-    chunks = chunk_text(transcript, chunk_size, overlap)
+    # Auto-adjust chunking: start with entire transcript, rely on safe splitting upon context-length errors
+    chunks = [transcript]
+    logger.debug(f"Starting chunked summary with a single chunk of length {len(transcript)} chars")
     
     # Store chunks in session state for chat
     st.session_state.current_transcript_chunks = chunks
@@ -298,7 +463,8 @@ def get_chunked_summary_from_lmstudio(transcript, language, model, custom_prompt
     # Process each chunk
     chunk_summaries = []
     for i, chunk in enumerate(chunks):
-        summary = process_chunk_with_lmstudio(
+        logger.debug(f"Summarizing chunk {i+1}/{len(chunks)}: length={len(chunk)} chars")
+        summary = safe_process_chunk_with_lmstudio(
             chunk,
             chunk_prompt_template,
             model,
@@ -310,32 +476,52 @@ def get_chunked_summary_from_lmstudio(transcript, language, model, custom_prompt
             "summary": summary
         })
     
+    logger.debug(f"Chunk summaries: {chunk_summaries}")
     # Create an overall summary if there are multiple chunks
     if len(chunks) > 1:
-        # Collect all chunk summaries
-        all_summaries = "\n\n".join([f"Chunk {i+1} summary:\n{s['summary']}" for i, s in enumerate(chunk_summaries)])
-        
-        overall_prompt = f"""
-        You have received summaries from different sections of a transcript.
-        Please synthesize these summaries into a coherent overall summary in {list(LANGUAGES.keys())[list(LANGUAGES.values()).index(language)]}.
-        
-        {all_summaries}
-        
-        Please provide:
-        1. A comprehensive summary (5-7 sentences)
-        2. 7-10 key talking points from across all sections
-        3. The most significant quotes or statements
-        """
-        
-        overall_summary = process_chunk_with_lmstudio(
-            "",  # No chunk needed for overall summary
-            overall_prompt,
-            model,
-            language
+        # Prepare overall summary by trimming chunk summaries to fit within the context window
+        summary_texts = [f"Chunk {i+1} summary:\n{s['summary']}" for i, s in enumerate(chunk_summaries)]
+        lang_name = list(LANGUAGES.keys())[list(LANGUAGES.values()).index(language)]
+        instr = (
+            f"You have received summaries from different sections of a transcript.\n"
+            f"Please synthesize these summaries into a coherent overall summary in {lang_name}.\n\n"
         )
+        tail = (
+            "\nPlease provide:\n"
+            "1. A comprehensive summary (5-7 sentences)\n"
+            "2. 7-10 key talking points from across all sections\n"
+            "3. The most significant quotes or statements"
+        )
+        context_limit = chunk_size
+        buffer_tokens = 200
+        # Helper to build and count tokens of the overall prompt
+        def build_prompt(parts):
+            return instr + "\n\n".join(parts) + tail
+        # Trim summaries until prompt fits within context limit
+        dropped = 0
+        total_tokens = estimate_tokens(build_prompt(summary_texts))
+        logging.debug(f"Overall summary prompt tokens before trimming: {total_tokens} / {context_limit}")
+        while summary_texts and estimate_tokens(build_prompt(summary_texts)) > context_limit - buffer_tokens:
+            summary_texts.pop(0)
+            dropped += 1
+        if dropped > 0:
+            new_total = estimate_tokens(build_prompt(summary_texts))
+            logging.warning(f"Dropped {dropped} chunk summaries to fit context window; token count now {new_total} / {context_limit}")
+        all_summaries = "\n\n".join(summary_texts)
+        overall_prompt = build_prompt(summary_texts)
+        # Log final token count
+        final_tokens = estimate_tokens(overall_prompt)
+        logging.info(f"Submitting overall summary prompt tokens: {final_tokens} / {context_limit}")
+        overall_summary = safe_process_chunk_with_lmstudio("", overall_prompt, model, language)
+        # If still hitting context-length error, unload and reload the model then retry
+        if isinstance(overall_summary, str) and ("context length" in overall_summary.lower() or "number of tokens to keep" in overall_summary.lower()):
+            unload_and_reload_lmstudio_model(model)
+            overall_summary = safe_process_chunk_with_lmstudio("", overall_prompt, model, language)
     else:
         # If there's only one chunk, use its summary as the overall summary
         overall_summary = chunk_summaries[0]["summary"]
+    logger.debug(f"Overall summary: {overall_summary}")
+    logger.debug(f"Returning chunked summary with overall_summary and {len(chunk_summaries)} chunk_summaries")
     
     return {
         "overall_summary": overall_summary,
@@ -356,6 +542,11 @@ def get_chat_response_from_lmstudio_chunks(chunks, question, language, model):
     Returns:
         str: The synthesized response
     """
+    logger.debug(
+        f"get_chat_response_from_lmstudio_chunks called with model={model}, language={language}, "
+        f"question={question}, number_of_chunks={len(chunks)}\n"
+        f"Full transcript:\n{''.join(chunks)}"
+    )
     # Process the question against each chunk
     chunk_responses = []
     
@@ -398,11 +589,15 @@ def get_chat_response_from_lmstudio_chunks(chunks, question, language, model):
     
     # If no chunk had relevant information
     if not chunk_responses:
-        return "I couldn't find any relevant information in the transcript to answer your question."
+        response_text = "I couldn't find any relevant information in the transcript to answer your question."
+        logger.debug(f"LMStudio RAG no relevant info, returning: {response_text}")
+        return response_text
     
     # If only one chunk had relevant information, return that response
     if len(chunk_responses) == 1:
-        return chunk_responses[0][1]
+        response_text = chunk_responses[0][1]
+        logger.debug(f"LMStudio RAG single chunk response: {response_text}")
+        return response_text
     
     # If multiple chunks had information, synthesize a response
     all_responses = "\n\n".join([f"Response from section {i+1}:\n{resp}" for i, resp in chunk_responses])
@@ -431,11 +626,17 @@ def get_chat_response_from_lmstudio_chunks(chunks, question, language, model):
         )
         
         if response.status_code == 200:
-            return response.json()["choices"][0]["message"]["content"]
+            response_text = response.json()["choices"][0]["message"]["content"]
+            logger.debug(f"LMStudio RAG synthesized response: {response_text}")
+            return response_text
         else:
-            return f"Error synthesizing responses: {response.status_code} - {response.text}"
+            response_text = f"Error synthesizing responses: {response.status_code} - {response.text}"
+            logger.debug(response_text)
+            return response_text
     except Exception as e:
-        return f"Error connecting to LM Studio: {str(e)}"
+        response_text = f"Error connecting to LM Studio: {str(e)}"
+        logger.debug(response_text)
+        return response_text
 
 # Function to ensure directory exists
 def ensure_dir(directory):
@@ -452,7 +653,8 @@ def clean_filename(title):
 
 # Function to process a single YouTube URL
 def process_youtube_url(url, language_code, audio_dir, transcript_dir, whisper_model_size,
-                       backend, model, keep_audio, token_limit, custom_prompt):
+                       backend, model, keep_audio, token_limit, custom_prompt,
+                       use_youtube_transcript=False):
     results = {
         "success": False,
         "video_title": "",
@@ -465,33 +667,57 @@ def process_youtube_url(url, language_code, audio_dir, transcript_dir, whisper_m
         "error": ""
     }
     try:
-        # Download audio
-        temp_filename = f"yt_audio_{os.path.basename(tempfile.mktemp())}"
-        final_audio_path, video_title = download_youtube_audio(url, audio_dir, temp_filename)
+        # Get video metadata and determine transcript path
+        ydl_meta_opts = {'quiet': True, 'no_warnings': True}
+        with yt_dlp.YoutubeDL(ydl_meta_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+        video_title = info.get('title', 'Unknown Title')
         results["video_title"] = video_title
-        # Create clean title for output files
+        # Prepare filename and paths
         clean_title = clean_filename(video_title)
-        # Rename the file to use the video title if keep_audio is True
-        if keep_audio:
-            new_audio_path = os.path.join(audio_dir, f"{clean_title}.mp3")
-            if final_audio_path != new_audio_path:
-                # Only rename if the paths are different
-                if os.path.exists(new_audio_path):
-                    # If file already exists, add a timestamp
-                    timestamp = int(time.time())
-                    new_audio_path = os.path.join(audio_dir, f"{clean_title}_{timestamp}.mp3")
-                os.rename(final_audio_path, new_audio_path)
-                final_audio_path = new_audio_path
-        results["audio_path"] = final_audio_path
-        # Transcribe audio
-        transcript = transcribe_audio(final_audio_path, language_code, whisper_model_size)
-        results["transcript"] = transcript
-        # Save transcript
         transcript_filename = f"{clean_title}_transcript.txt"
         transcript_path = os.path.join(transcript_dir, transcript_filename)
-        with open(transcript_path, 'w', encoding='utf-8') as f:
-            f.write(transcript)
-        results["transcript_path"] = transcript_path
+        # Determine transcription source
+        skip_transcription = False
+        # 1) Use YouTube auto-generated transcript if requested and available
+        if use_youtube_transcript:
+            fetched = get_youtube_transcript(url, language_code)
+            if fetched:
+                transcript = fetched
+                results["transcript"] = transcript
+                results["transcript_path"] = transcript_path
+                # Save fetched transcript
+                with open(transcript_path, 'w', encoding='utf-8') as f:
+                    f.write(transcript)
+                skip_transcription = True
+        # 2) Load existing local transcript if present and not already loaded
+        if not skip_transcription and os.path.exists(transcript_path):
+            with open(transcript_path, 'r', encoding='utf-8') as f:
+                transcript = f.read()
+            results["transcript"] = transcript
+            results["transcript_path"] = transcript_path
+            skip_transcription = True
+        # Download audio and transcribe if needed
+        if not skip_transcription:
+            temp_filename = f"yt_audio_{os.path.basename(tempfile.mktemp())}"
+            final_audio_path, _ = download_youtube_audio(url, audio_dir, temp_filename)
+            # Rename the file to use the video title if keep_audio is True
+            if keep_audio:
+                new_audio_path = os.path.join(audio_dir, f"{clean_title}.mp3")
+                if final_audio_path != new_audio_path:
+                    if os.path.exists(new_audio_path):
+                        timestamp = int(time.time())
+                        new_audio_path = os.path.join(audio_dir, f"{clean_title}_{timestamp}.mp3")
+                    os.rename(final_audio_path, new_audio_path)
+                    final_audio_path = new_audio_path
+            results["audio_path"] = final_audio_path
+            # Transcribe audio
+            transcript = transcribe_audio(final_audio_path, language_code, whisper_model_size)
+            results["transcript"] = transcript
+            # Save transcript
+            with open(transcript_path, 'w', encoding='utf-8') as f:
+                f.write(transcript)
+            results["transcript_path"] = transcript_path
         
         # Generate summary based on backend
         if backend == "Ollama":
@@ -522,8 +748,8 @@ def process_youtube_url(url, language_code, audio_dir, transcript_dir, whisper_m
                     
         results["summary_path"] = summary_path
         
-        # Clean up if not keeping audio
-        if not keep_audio:
+        # Clean up audio file if downloaded and not keeping audio
+        if not skip_transcription and not keep_audio:
             os.remove(final_audio_path)
             
         results["success"] = True
@@ -713,19 +939,10 @@ Please provide:
         )
     else:
         custom_prompt = None
-    # Token limit slider
-    st.subheader("Token/Chunk Size")
-    st.info("This sets both the token limit for summarization and the chunk size for RAG processing")
-    token_limit = st.slider("Size", 1000, 16000, 4000, 1000, 
-                           help="Larger values process more text at once but may exceed model context limits")
-    
-    # Overlap percentage for chunking
-    if backend == "LM Studio":
-        overlap_percent = st.slider("Chunk overlap percentage", 5, 25, 10, 
-                                  help="Percentage of overlap between chunks to maintain context")
-        chunk_overlap = int(token_limit * overlap_percent / 100)
-    else:
-        chunk_overlap = 200  # Default value for Ollama
+    # Fixed token/chunk size configuration
+    # These are now constants (no user control in the UI)
+    token_limit = 90000  # token limit for summarization and chunk size for RAG
+    chunk_overlap = 200  # overlap between chunks for LM Studio processing
 
 # Single Video Tab
 with tab1:
@@ -742,6 +959,15 @@ with tab1:
         source_type = "upload" if uploaded_file else "youtube"
     selected_language = st.selectbox("Select Language", list(LANGUAGES.keys()))
     language_code = LANGUAGES[selected_language]
+    # Option: use YouTube auto-generated captions instead of Whisper transcription
+    if source_type == "youtube":
+        use_youtube_transcript = st.checkbox(
+            "Use YouTube auto-generated transcript (if available)",
+            value=False,
+            help="Fetch and use YouTube's auto captions for summarization instead of Whisper"
+        )
+    else:
+        use_youtube_transcript = False
     # Process button
     if st.button("Process Audio", key="process_single"):
         if (source_type == "youtube" and youtube_url) or (source_type == "upload" and uploaded_file):
@@ -767,20 +993,136 @@ with tab1:
                     progress_bar = st.progress(0)
                     status = st.empty()
                     if source_type == "youtube":
-                        status.info("Downloading YouTube audio...")
-                        progress_bar.progress(10)
-                        results = process_youtube_url(
-                            youtube_url,
-                            language_code,
-                            audio_dir,
-                            transcript_dir,
-                            whisper_model_size,
-                            backend,
-                            model,
-                            keep_audio,
-                            token_limit,
-                            custom_prompt
-                        )
+                        # Detailed processing for a single YouTube URL
+                        results = {
+                            "success": False,
+                            "video_title": "",
+                            "audio_path": "",
+                            "transcript": "",
+                            "transcript_path": "",
+                            "summary": "",
+                            "summary_path": "",
+                            "chunk_summaries": [],
+                            "error": ""
+                        }
+                        try:
+                            # Step 1: Fetch video metadata
+                            status.info("Fetching video metadata...")
+                            progress_bar.progress(5)
+                            with yt_dlp.YoutubeDL({'quiet': True, 'no_warnings': True}) as ydl:
+                                meta = ydl.extract_info(youtube_url, download=False)
+                            title = meta.get('title', 'Unknown Title')
+                            results["video_title"] = title
+                            status.success(f"Video title: {title}")
+                            progress_bar.progress(10)
+
+                            # Prepare file names and paths
+                            clean_title = clean_filename(title)
+                            transcript_fn = f"{clean_title}_transcript.txt"
+                            transcript_path = os.path.join(transcript_dir, transcript_fn)
+
+                            # Step 2: Load or fetch transcript
+                            skip_transcription = False
+                            if use_youtube_transcript:
+                                status.info("Fetching YouTube auto-captions...")
+                                progress_bar.progress(15)
+                                caps = get_youtube_transcript(youtube_url, language_code)
+                                if caps:
+                                    transcript = caps
+                                    results["transcript"] = transcript
+                                    results["transcript_path"] = transcript_path
+                                    with open(transcript_path, 'w', encoding='utf-8') as f:
+                                        f.write(transcript)
+                                    status.success("Using YouTube auto-generated transcript")
+                                    progress_bar.progress(30)
+                                    skip_transcription = True
+                                else:
+                                    status.warning("No auto-captions available; will use Whisper")
+                            if not skip_transcription and os.path.exists(transcript_path):
+                                status.info("Found existing transcript; skipping transcription")
+                                progress_bar.progress(30)
+                                with open(transcript_path, 'r', encoding='utf-8') as f:
+                                    transcript = f.read()
+                                results["transcript"] = transcript
+                                results["transcript_path"] = transcript_path
+                                skip_transcription = True
+
+                            # Step 3: Download audio & transcribe if necessary
+                            if not skip_transcription:
+                                status.info("Downloading audio...")
+                                progress_bar.progress(35)
+                                tmp = f"yt_audio_{os.path.basename(tempfile.mktemp())}"
+                                audio_path, _ = download_youtube_audio(youtube_url, audio_dir, tmp)
+                                results["audio_path"] = audio_path
+                                status.success(f"Audio downloaded: {audio_path}")
+                                progress_bar.progress(45)
+
+                                if keep_audio:
+                                    status.info("Organizing audio file...")
+                                    target = os.path.join(audio_dir, f"{clean_title}.mp3")
+                                    if audio_path != target:
+                                        if os.path.exists(target):
+                                            ts = int(time.time())
+                                            target = os.path.join(audio_dir, f"{clean_title}_{ts}.mp3")
+                                        os.rename(audio_path, target)
+                                        audio_path = target
+                                    results["audio_path"] = audio_path
+                                    status.success(f"Audio file kept: {audio_path}")
+                                progress_bar.progress(50)
+
+                                status.info(f"Transcribing with Whisper (model={whisper_model_size})...")
+                                transcript = transcribe_audio(audio_path, language_code, whisper_model_size)
+                                results["transcript"] = transcript
+                                status.success("Whisper transcription complete")
+                                progress_bar.progress(70)
+
+                                status.info(f"Saving transcript to {transcript_path}")
+                                with open(transcript_path, 'w', encoding='utf-8') as f:
+                                    f.write(transcript)
+                                results["transcript_path"] = transcript_path
+                                status.success("Transcript saved")
+                                progress_bar.progress(75)
+
+                            # Step 4: Summarization
+                            if backend == "Ollama":
+                                status.info(f"Summarizing with Ollama ({model}), token limit={token_limit}")
+                                summary = get_summary_from_ollama(results["transcript"], language_code, model, custom_prompt, token_limit)
+                                results["summary"] = summary
+                                status.success("Ollama summary complete")
+                                progress_bar.progress(90)
+                            else:
+                                status.info(f"Summarizing with LM Studio ({model}), chunk size={token_limit}, overlap={chunk_overlap}")
+                                sumr = get_chunked_summary_from_lmstudio(results["transcript"], language_code, model, custom_prompt, token_limit, chunk_overlap)
+                                results["summary"] = sumr["overall_summary"]
+                                results["chunk_summaries"] = sumr["chunk_summaries"]
+                                status.success("LM Studio summary complete")
+                                status.info(f"Processed {len(results['chunk_summaries'])} chunks")
+                                progress_bar.progress(90)
+
+                            # Step 5: Save summary
+                            sum_fn = f"{clean_title}_summary.txt"
+                            sum_path = os.path.join(transcript_dir, sum_fn)
+                            status.info(f"Saving summary to {sum_path}")
+                            with open(sum_path, 'w', encoding='utf-8') as f:
+                                f.write(results["summary"])
+                                if results.get("chunk_summaries"):
+                                    f.write("\n\n--- INDIVIDUAL SECTION SUMMARIES ---\n\n")
+                                    for idx, cs in enumerate(results["chunk_summaries"]):
+                                        f.write(f"Section {idx+1}:\n{cs['summary']}\n\n")
+                            results["summary_path"] = sum_path
+                            status.success("Summary saved")
+                            progress_bar.progress(95)
+
+                            # Step 6: Cleanup
+                            if not use_youtube_transcript and not keep_audio and not skip_transcription:
+                                status.info("Removing temporary audio file")
+                                os.remove(audio_path)
+                                status.success("Audio file removed")
+                            progress_bar.progress(100)
+
+                            results["success"] = True
+                        except Exception as e:
+                            results = {"success": False, "error": str(e)}
                     else:  # upload
                         status.info("Processing uploaded audio...")
                         progress_bar.progress(20)

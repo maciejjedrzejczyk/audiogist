@@ -259,3 +259,10 @@ The Docker setup can be extended to integrate with other tools:
 - Add a database container for persistent storage of transcripts and summaries
 - Integrate with a web server for public hosting
 - Connect to cloud storage for scalable file management
+  
+## Logging
+
+AudioGist provides detailed debug logs to help you trace the end-to-end processing of audio, transcription, summarization, and chat. Logs include full transcripts, user questions, prompts sent to AI backends, API calls, and progress information.
+  
+- Logs are written to a file named `audiogist.log` in the current working directory by default.
+- You can specify a custom log file path by setting the `AUDIOGIST_LOG` environment variable before starting the application.

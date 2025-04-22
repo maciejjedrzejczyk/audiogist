@@ -28,6 +28,7 @@ AudioGist automatically processes YouTube videos and locally downloaded audio fi
 
 - **Advanced Transcription**:
   - Transcribe audio using OpenAI's Whisper (runs locally)
+  - **NEW**: Direct use of YouTube auto-generated captions when available
   - Support for multiple languages
   - Choose from different model sizes (tiny to large)
   - Automatic token count estimation
@@ -38,16 +39,18 @@ AudioGist automatically processes YouTube videos and locally downloaded audio fi
   - Provide overall summaries
   - Custom prompt templates
 
-- **RAG Processing (with LMStudio)**:
+- **RAG Processing**:
   - Process long transcripts in chunks for better analysis
+  - **IMPROVED**: Now available for both Ollama and LM Studio backends
   - Provide both overall summaries and section-by-section insights
   - Customizable token/chunk sizes
 
 - **Interactive Chat**:
+  - **ENHANCED**: Fully functional chat interface for both Ollama and LM Studio
   - Ask questions about the transcript
   - Get AI-generated answers based on relevant sections 
   - Persistent chat history
-  - Synthesized responses from multiple transcript chunks (LMStudio only)
+  - Context-aware responses that consider previous conversation
 
 - **File Management**:
   - Save audio files, transcripts, and summaries
@@ -146,9 +149,10 @@ http://localhost:8501
 2. Select the "YouTube URL" tab
 3. Paste a YouTube video URL
 4. Select the language of the video
-5. Click "Process Audio"
-6. View and download the transcript and summary
-7. Explore section-by-section summaries if available
+5. **NEW**: Choose whether to use YouTube auto-generated captions when available
+6. Click "Process Audio"
+7. View and download the transcript and summary
+8. Explore section-by-section summaries if available
 
 ### Processing a Local Audio File
 
@@ -176,6 +180,7 @@ http://localhost:8501
 3. Type your question about the transcript
 4. View the AI-generated response that synthesizes information from relevant sections
 5. Continue the conversation with follow-up questions
+6. **NEW**: Chat history is maintained during your session and reset when processing a new video
 
 ## Configuration
 
@@ -185,11 +190,16 @@ http://localhost:8501
   - Larger models provide better accuracy but require more resources
   - The "base" model is a good balance for most use cases
 
+- **YouTube Auto-Generated Captions**: 
+  - **NEW**: Enable to use YouTube's auto-generated captions when available
+  - Significantly faster than transcribing with Whisper
+  - Quality depends on the original video's audio clarity
+
 ### AI Backend Settings
 
 - **Backend**: Choose between Ollama and LM Studio
 - **Shorter content**: Ollama is recommended
-- **Longer content requiring chunking and RAG**: LM Studio is recommended
+- **Longer content requiring chunking and RAG**: Both backends now support RAG processing
 
 ### Customization
 
@@ -202,7 +212,7 @@ http://localhost:8501
   - Higher values process more text at once but may exceed model capabilities
   - 4000 tokens is a good default for most models
 
-- **Chunk Overlap Percentage**: (LM Studio only) Adjust overlap between chunks
+- **Chunk Overlap Percentage**: Adjust overlap between chunks
   - Higher values provide better context continuity between chunks
   - 10% is a good default value
 
@@ -216,6 +226,7 @@ The Docker container supports the following environment variables:
 - `LMSTUDIO_HOST`: URL for the LM Studio API (default: http://host.docker.internal:1234)
 - `DOWNLOAD_DIR`: Directory for downloaded audio files (default: /app/downloads)
 - `TRANSCRIPT_DIR`: Directory for saved transcripts (default: /app/transcripts)
+- `AUDIOGIST_LOG_DIR`: Directory for log files (default: current working directory)
 
 ## Troubleshooting
 
@@ -224,6 +235,10 @@ The Docker container supports the following environment variables:
 
 - **"LM Studio is not running"**: Make sure LM Studio is running with the API server enabled
   - For Docker: Ensure the host machine's LM Studio is accessible to the container
+
+- **YouTube caption issues**: 
+  - **NEW**: If YouTube captions aren't working, try disabling the "Use YouTube auto-generated captions" option
+  - Some videos may not have auto-generated captions available
 
 - **Transcription errors**: Try using a smaller Whisper model or check your audio quality
 
@@ -243,7 +258,7 @@ The Docker container supports the following environment variables:
 
 ### Customizing RAG Processing
 
-When using LM Studio, the application leverages Retrieval-Augmented Generation (RAG) to:
+The application leverages Retrieval-Augmented Generation (RAG) to:
 
 1. Break long transcripts into manageable chunks
 2. Process each chunk independently
@@ -264,5 +279,30 @@ The Docker setup can be extended to integrate with other tools:
 
 AudioGist provides detailed debug logs to help you trace the end-to-end processing of audio, transcription, summarization, and chat. Logs include full transcripts, user questions, prompts sent to AI backends, API calls, and progress information.
   
-- Logs are written to a file named `audiogist.log` in the current working directory by default.
-- You can specify a custom log file path by setting the `AUDIOGIST_LOG` environment variable before starting the application.
+- Logs are written to a file named `audiogist-YYYYMMDD-HHMM.log` in the current working directory by default.
+- The log filename includes a session ID based on the date and hour when the application was started.
+- All tasks performed during a single application run are logged to the same file.
+- You can specify a custom log directory by setting the `AUDIOGIST_LOG_DIR` environment variable before starting the application.
+
+## Recent Updates
+
+### YouTube Auto-Generated Captions
+- Added support for directly using YouTube's auto-generated captions
+- Significantly faster processing when captions are available
+- Toggle option to enable/disable this feature
+
+### Enhanced Chat Functionality
+- Fully implemented chat interface for both Ollama and LM Studio backends
+- Improved context handling for more coherent conversations
+- Better error handling and user feedback
+
+### Improved RAG Processing
+- Extended RAG capabilities to both Ollama and LM Studio
+- Better handling of long transcripts
+- More robust chunking and synthesis
+
+### Bug Fixes
+- Fixed issues with transcript processing
+- Improved error handling throughout the application
+- Better session state management
+- Fixed indentation and syntax errors

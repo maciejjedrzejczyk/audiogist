@@ -10,6 +10,7 @@ import glob
 import time
 import re
 import numpy as np
+import concurrent.futures
 from datetime import datetime
 
 # Set up logging
@@ -194,7 +195,7 @@ def transcribe_audio(audio_path, language_code, model_size="base"):
         return f"Error transcribing audio: {str(e)}"
 
 # Function to process a single YouTube video
-def process_youtube_video(url, language_code, whisper_model_size, backend, model, token_limit, custom_prompt, chunk_overlap_pct=10, use_youtube_transcript=True):
+def process_youtube_video(url, language_code, whisper_model_size, backend, model, token_limit, custom_prompt, chunk_overlap_pct=10, use_youtube_transcript=True, status_callback=None):
     try:
         # Validate URL
         if not url or not isinstance(url, str) or not url.strip():
@@ -205,13 +206,14 @@ def process_youtube_video(url, language_code, whisper_model_size, backend, model
         url_hash = str(hash(url))[-8:]  # Last 8 chars of hash
         filename_base = f"yt_{url_hash}"
         
-        with st.status(f"Processing video...") as status:
+        # For batch processing, we don't use the st.status context manager
+        if status_callback:
             # Step 1: Try to get YouTube auto-generated transcript if requested
             transcript = None
             video_title = None
             
             if use_youtube_transcript:
-                status.update(label="Fetching YouTube auto-generated captions...")
+                status_callback("Fetching YouTube auto-generated captions...")
                 try:
                     transcript, video_title = get_youtube_transcript(url, language_code)
                     
@@ -227,11 +229,11 @@ def process_youtube_video(url, language_code, whisper_model_size, backend, model
             if not transcript:
                 try:
                     # Download the audio
-                    status.update(label="Downloading audio from YouTube...")
+                    status_callback("Downloading audio from YouTube...")
                     audio_path, video_title = download_youtube_audio(url, "downloads", filename_base)
                     
                     # Transcribe the audio
-                    status.update(label="Transcribing audio...")
+                    status_callback("Transcribing audio...")
                     transcript = transcribe_audio(audio_path, language_code, whisper_model_size)
                 except Exception as e:
                     logger.error(f"Error downloading/transcribing audio: {str(e)}")
@@ -251,7 +253,7 @@ def process_youtube_video(url, language_code, whisper_model_size, backend, model
                 f.write(transcript_text)
             
             # Step 3: Generate summary
-            status.update(label="Generating summary...")
+            status_callback("Generating summary...")
             
             # Format the prompt
             language_name = "English"  # Default
@@ -324,6 +326,128 @@ def process_youtube_video(url, language_code, whisper_model_size, backend, model
             st.session_state.chat_history = []  # Reset chat history for new video
             
             return transcript_text, summary, video_title, transcript_path, summary_path
+        
+        # For single video processing, use the st.status context manager
+        else:
+            with st.status(f"Processing video...") as status:
+                # Step 1: Try to get YouTube auto-generated transcript if requested
+                transcript = None
+                video_title = None
+                
+                if use_youtube_transcript:
+                    status.update(label="Fetching YouTube auto-generated captions...")
+                    try:
+                        transcript, video_title = get_youtube_transcript(url, language_code)
+                        
+                        if transcript:
+                            logger.info(f"Using YouTube auto-generated transcript for {url}")
+                        else:
+                            logger.info(f"No YouTube auto-generated transcript available for {url}, will transcribe audio")
+                    except Exception as e:
+                        logger.error(f"Error fetching YouTube transcript: {str(e)}")
+                        transcript = None
+                
+                # Step 2: If no transcript from YouTube, download and transcribe the audio
+                if not transcript:
+                    try:
+                        # Download the audio
+                        status.update(label="Downloading audio from YouTube...")
+                        audio_path, video_title = download_youtube_audio(url, "downloads", filename_base)
+                        
+                        # Transcribe the audio
+                        status.update(label="Transcribing audio...")
+                        transcript = transcribe_audio(audio_path, language_code, whisper_model_size)
+                    except Exception as e:
+                        logger.error(f"Error downloading/transcribing audio: {str(e)}")
+                        return None, f"Error: {str(e)}", None, None, None
+                
+                # Save transcript to file
+                transcript_path = os.path.join("transcripts", f"{filename_base}_transcript.txt")
+                os.makedirs("transcripts", exist_ok=True)
+                
+                # Ensure transcript is a string before writing to file
+                if isinstance(transcript, list):
+                    transcript_text = ' '.join(transcript)
+                else:
+                    transcript_text = transcript
+                    
+                with open(transcript_path, "w", encoding="utf-8") as f:
+                    f.write(transcript_text)
+                
+                # Step 3: Generate summary
+                status.update(label="Generating summary...")
+                
+                # Format the prompt
+                language_name = "English"  # Default
+                
+                # Ensure transcript is a string before formatting prompt
+                if isinstance(transcript, list):
+                    transcript_text = ' '.join(transcript)
+                else:
+                    transcript_text = transcript
+                    
+                formatted_prompt = custom_prompt.format(transcript=transcript_text, language=language_name)
+                
+                # Check if transcript is too long and needs chunking
+                estimated_tokens = estimate_tokens(transcript)
+                logger.info(f"Estimated token count for transcript: {estimated_tokens}")
+                
+                if backend == "Ollama":
+                    if estimated_tokens > token_limit:
+                        # Use RAG approach for Ollama (similar to LM Studio)
+                        chunk_overlap = int(token_limit * (chunk_overlap_pct / 100))
+                        # Make sure transcript is a string before chunking
+                        if isinstance(transcript, list):
+                            transcript = ' '.join(transcript)
+                        chunks = chunk_text(transcript, token_limit, chunk_overlap)
+                        from ollama_client import get_efficient_summary_from_ollama
+                        summary = get_efficient_summary_from_ollama(chunks, language_name, model, custom_prompt)
+                    else:
+                        # Make sure transcript is a string
+                        if isinstance(transcript, list):
+                            transcript = ' '.join(transcript)
+                        formatted_prompt = custom_prompt.format(transcript=transcript, language=language_name)
+                        from ollama_client import process_with_ollama
+                        summary = process_with_ollama(formatted_prompt, model)
+                else:  # LM Studio
+                    try:
+                        if estimated_tokens > token_limit:
+                            # Use RAG approach for LM Studio
+                            chunk_overlap = int(token_limit * (chunk_overlap_pct / 100))
+                            # Make sure transcript is a string before chunking
+                            if isinstance(transcript, list):
+                                transcript = ' '.join(transcript)
+                            chunks = chunk_text(transcript, token_limit, chunk_overlap)
+                            from lmstudio_client import get_efficient_summary_from_lmstudio
+                            summary = get_efficient_summary_from_lmstudio(chunks, language_name, model)
+                        else:
+                            # Make sure transcript is a string
+                            if isinstance(transcript, list):
+                                transcript = ' '.join(transcript)
+                            formatted_prompt = custom_prompt.format(transcript=transcript, language=language_name)
+                            from lmstudio_client import process_with_lmstudio
+                            summary = process_with_lmstudio(formatted_prompt, model)
+                        
+                        # Check if summary is None or error message
+                        if not summary:
+                            summary = "Error: Failed to generate summary"
+                        elif summary.startswith("Error:"):
+                            logger.error(f"LM Studio error: {summary}")
+                    except Exception as e:
+                        logger.error(f"Exception in LM Studio processing: {str(e)}")
+                        summary = f"Error: {str(e)}"
+                
+                # Save summary to file
+                summary_path = os.path.join("transcripts", f"{filename_base}_summary.txt")
+                with open(summary_path, "w", encoding="utf-8") as f:
+                    f.write(summary)
+                
+                # Store the current transcript and video title in session state for chat
+                st.session_state.current_transcript = transcript_text
+                st.session_state.current_video_title = video_title
+                st.session_state.chat_history = []  # Reset chat history for new video
+                
+                return transcript_text, summary, video_title, transcript_path, summary_path
     
     except Exception as e:
         logger.error(f"Error processing YouTube video: {str(e)}", exc_info=True)
@@ -556,12 +680,188 @@ def main():
     # Tab 2: Batch Processing
     with tab2:
         st.subheader("Batch Process YouTube Videos")
-        batch_urls = st.text_area("Enter YouTube URLs (one per line)")
-        batch_language = st.selectbox("Language for All Videos", ["English", "Spanish", "French", "German", "Italian", "Portuguese", "Dutch", "Polish", "Russian", "Japanese", "Chinese", "Korean", "Arabic", "Hindi", "Turkish", "Vietnamese"])
-        parallel_downloads = st.slider("Parallel Downloads", 1, 5, 2)
+        
+        # Create two columns for input and settings
+        col1, col2 = st.columns([3, 2])
+        
+        with col1:
+            batch_urls = st.text_area("Enter YouTube URLs (one per line)", height=200)
+            batch_language = st.selectbox("Language for All Videos", ["English", "Spanish", "French", "German", "Italian", "Portuguese", "Dutch", "Polish", "Russian", "Japanese", "Chinese", "Korean", "Arabic", "Hindi", "Turkish", "Vietnamese"])
+            parallel_downloads = st.slider("Parallel Downloads", 1, 5, 2)
+        
+        with col2:
+            # Advanced settings
+            with st.expander("Advanced Settings", expanded=True):
+                # Backend selection
+                batch_backend = st.selectbox("AI Backend", ["Ollama", "LM Studio"], key="batch_backend")
+                
+                # Get available models based on backend
+                if batch_backend == "Ollama":
+                    # Use cached models or default list
+                    if not st.session_state.ollama_models:
+                        try:
+                            st.session_state.ollama_models = get_available_ollama_models()
+                        except:
+                            st.session_state.ollama_models = ["llama3", "mistral", "mixtral"]
+                    
+                    batch_model = st.selectbox("Model", st.session_state.ollama_models if st.session_state.ollama_models else ["llama3", "mistral", "mixtral"], key="batch_model")
+                else:  # LM Studio
+                    # Use cached models or default list
+                    if not st.session_state.lmstudio_models:
+                        try:
+                            st.session_state.lmstudio_models = get_available_lmstudio_models()
+                        except:
+                            st.session_state.lmstudio_models = ["Llama-3-8B-Instruct", "Mistral-7B-Instruct-v0.2", "Mixtral-8x7B-Instruct-v0.1"]
+                    
+                    batch_model = st.selectbox("Model", st.session_state.lmstudio_models if st.session_state.lmstudio_models else ["Llama-3-8B-Instruct", "Mistral-7B-Instruct-v0.2", "Mixtral-8x7B-Instruct-v0.1"], key="batch_model")
+                
+                # Whisper model selection
+                batch_whisper_model = st.selectbox("Whisper Model Size", ["tiny", "base", "small", "medium", "large"], index=1, key="batch_whisper_model")
+                
+                # YouTube transcript option
+                batch_use_youtube_transcript = st.checkbox("Use YouTube auto-generated captions when available", value=True, key="batch_use_youtube_transcript")
+                
+                # Custom prompt
+                batch_use_custom_prompt = st.checkbox("Use Custom Prompt", key="batch_use_custom_prompt")
+                if batch_use_custom_prompt:
+                    batch_custom_prompt = st.text_area("Custom Prompt", "Please summarize the following transcript in {language}:\n\n{transcript}", key="batch_custom_prompt")
+                else:
+                    batch_custom_prompt = "Please summarize the following transcript in {language}:\n\n{transcript}"
+                
+                # Token limit
+                batch_token_limit = st.slider("Token Limit", 1000, 8000, 4000, key="batch_token_limit")
+                
+                # Chunk overlap (for both backends now)
+                batch_chunk_overlap = st.slider("Chunk Overlap Percentage", 0, 50, 10, key="batch_chunk_overlap")
         
         if st.button("Process All Videos"):
-            st.error("Batch processing not implemented in this simplified example")
+            # Parse URLs
+            urls = [url.strip() for url in batch_urls.split('\n') if url.strip()]
+            
+            if not urls:
+                st.error("Please enter at least one YouTube URL")
+            else:
+                # Create a container for results
+                results_container = st.container()
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                
+                # Process videos in parallel
+                language_code = batch_language.lower()[:2]  # Simple language code extraction
+                
+                # Create a list to store results
+                all_results = []
+                
+                # Define a function to process a single URL
+                def process_single_url(url):
+                    try:
+                        # Create a status update function that will be called from the worker thread
+                        def update_status(message):
+                            # This function doesn't actually update the UI - it just logs the message
+                            # The actual UI updates happen in the main thread
+                            logger.info(f"Processing {url}: {message}")
+                        
+                        # Process the video with our status callback
+                        transcript, summary, video_title, transcript_path, summary_path = process_youtube_video(
+                            url, language_code, batch_whisper_model, batch_backend, batch_model, 
+                            batch_token_limit, batch_custom_prompt, batch_chunk_overlap, batch_use_youtube_transcript,
+                            status_callback=update_status
+                        )
+                        
+                        # Return the results
+                        return {
+                            "url": url,
+                            "title": video_title,
+                            "success": transcript is not None and summary is not None,
+                            "transcript": transcript,
+                            "summary": summary,
+                            "transcript_path": transcript_path,
+                            "summary_path": summary_path
+                        }
+                    except Exception as e:
+                        logger.error(f"Error processing URL {url}: {str(e)}", exc_info=True)
+                        return {
+                            "url": url,
+                            "title": None,
+                            "success": False,
+                            "error": str(e),
+                            "transcript": None,
+                            "summary": None,
+                            "transcript_path": None,
+                            "summary_path": None
+                        }
+                
+                # Process URLs in parallel
+                with concurrent.futures.ThreadPoolExecutor(max_workers=parallel_downloads) as executor:
+                    # Submit all tasks
+                    future_to_url = {
+                        executor.submit(process_single_url, url): url 
+                        for url in urls
+                    }
+                    
+                    # Process results as they complete
+                    completed = 0
+                    for future in concurrent.futures.as_completed(future_to_url):
+                        url = future_to_url[future]
+                        try:
+                            # Update status text from the main thread
+                            status_text.text(f"Processing video {completed+1}/{len(urls)}: {url}")
+                            
+                            result = future.result()
+                            all_results.append(result)
+                            
+                            # Update status with success/failure
+                            if result["success"]:
+                                status_text.text(f"Completed {completed+1}/{len(urls)}: {result['title'] or url} ✅")
+                            else:
+                                status_text.text(f"Failed {completed+1}/{len(urls)}: {url} ❌")
+                                
+                        except Exception as e:
+                            logger.error(f"Exception processing {url}: {str(e)}", exc_info=True)
+                            all_results.append({
+                                "url": url,
+                                "title": None,
+                                "success": False,
+                                "error": str(e),
+                                "transcript": None,
+                                "summary": None,
+                                "transcript_path": None,
+                                "summary_path": None
+                            })
+                            status_text.text(f"Failed {completed+1}/{len(urls)}: {url} ❌")
+                        
+                        # Update progress
+                        completed += 1
+                        progress_bar.progress(completed / len(urls))
+                
+                # Display results
+                progress_bar.progress(1.0)
+                status_text.text(f"Completed processing {len(urls)} videos")
+                
+                # Sort results by success status
+                all_results.sort(key=lambda x: (not x["success"], x["title"] or ""))
+                
+                # Display results in an expander for each video
+                for result in all_results:
+                    with results_container.expander(f"{result['title'] or result['url']} - {'✅ Success' if result['success'] else '❌ Failed'}"):
+                        if result["success"]:
+                            st.markdown(f"**URL:** {result['url']}")
+                            
+                            # Create two columns for transcript and summary
+                            col1, col2 = st.columns(2)
+                            
+                            with col1:
+                                st.subheader("Transcript")
+                                st.text_area("", result["transcript"][:5000] + ("..." if len(result["transcript"]) > 5000 else ""), height=200)
+                                st.download_button("Download Full Transcript", result["transcript"], file_name=f"{result['title']}_transcript.txt")
+                            
+                            with col2:
+                                st.subheader("Summary")
+                                st.text_area("", result["summary"], height=200)
+                                st.download_button("Download Summary", result["summary"], file_name=f"{result['title']}_summary.txt")
+                        else:
+                            st.error(f"Failed to process: {result.get('error', 'Unknown error')}")
+                            st.markdown(f"**URL:** {result['url']}")
     
     # Tab 3: Chat with Transcript
     with tab3:
